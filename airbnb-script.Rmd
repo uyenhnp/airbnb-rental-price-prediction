@@ -1,0 +1,654 @@
+---
+title: "AIRBNB LISTING RENTAL PRICE PREDICTION IN NEW YORK CITY"
+author: "Uyen Huynh"
+date: "6/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### Tables of Contents
+[1. Problem Introduction & Data set]  
+[2. Data Preprocessing]  
+[3. Data Visualization]  
+[4. Proposed Model]  
+- [Model 1 (baseline): Price ~ neighbourhood_group + latitude + longitude + room_type + minimum_nights + number_of_reviews + last_review + reviews_per_month + calculated_host_listings_count + availability_365]  
+- [Model 2: Baseline + Convert minimum_nights (variable transformation)]  
+- [Model 3: Baseline + Convert minimum_night + reviews_per_month/number_of_reviews (interaction effect)]  
+- [Model 4: Model 3 + Convert name (variable transformation)]  
+[a. Unigram keywords]  
+[b. Bigram keywords]  
+[c. Using both unigram and bigram]  
+[5. Conclusion]  
+
+## 1. Problem Introduction & Data set
+
+In this project, we would like to target the scientific question of predicting Airbnb listing prices in New York city using other information about a listing such as location (GPS coordinates, neighbourhood), number of reviews, number of listings its host has, whether it is shared space, its availability throughout the year, etc. Our project objective is to figure out the major factors that influence the price of a listing and whether there exists any interesting patterns that allow us to know more about the renting market in New York city. We plan to achieve this goal by applying statistical learning methods that we have learned throughout the course to predict listing prices and explore the important features that have significant effects.  
+The data set we use to explore can be directly downloaded on the [Kaggle website](https://www.kaggle.com/dgomonov/new-york-city-airbnb-open-data). Each observation contains detailed information about an Airbnb listing in New York city in 2019. There are 48895 observations and 16 features, including:   
+- **ID**: listing ID.  
+- **name**: name of the listing.  
+- **host ID**: ID of the host.  
+- **host_name**: name of the host.  
+- **neighbourhood_group**: the borough in New York.  
+- **neighbourhood**: the area of the listing.  
+- **latitude**: latitude coordinate of the listing.  
+- **longitude**: longitude coordinate of the listing.  
+- **room_type**: type of the listing, e.g., a private room or an entire apartment.  
+- **price**: price in dollars.  
+- **minimum_nights**: number of minimum nights that customers have to spend.  
+- **number_of_reviews**: total number of reviews of the listing.  
+- **last_review**: when the latest review was posted.  
+- **reviews_per_month**: average monthly number of reviews of the listing.  
+- **calculated_host_listings_count**: number of listings the host owns.  
+- **availability_365**: number of available days through the year 2019 that people could book the listing.  
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+source('data/hw.R')
+library(readr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(corrplot)
+library(ggplot2)
+library(GGally)
+library(randomForest)
+library(hash)
+library(purrr)
+library(wordcloud)
+library(boot)
+library(glmnet)
+library(forcats)
+library(lattice)
+library(hexbin)
+library(splines)
+```
+
+```{r load data}
+# upload the original data
+data <- read.csv("data/AB_NYC_2019.csv")
+head(data)
+```
+
+
+## 2. Data Preprocessing
+
+Before visualizing the data set and fitting models, we need to transform and convert some variables into other formats. The data preprocessing process is executed in details as follows:  
+- **neighbourhood_group** & **room_type**: these features are converted from character to factors. The number of levels of **neighbourhood_group** and **room_type** is 5 and 2 respectively.  
+- **last_review**: this feature has a date format. To convert it from date to numeric in a simple manner, we decide to keep the year number only.  
+Also, we exclude four features, including: **id**, **host_id**, **host_name** and **neighbourhood**. We determine that **id**, **host_id** and **host_name** of a listing are irrelevant for predicting price. Even though host name and id may be good indicators for price prediction (as some hosts appear to have better reputations over the others), we believe they are not good for generalizing to listings from new/unseen hosts and they are not interesting to learn from. We also exclude the **neighbourhood** categorical variable due to its numerous levels (as many as 221) with many of them having less than 4 observations, which may make the model prone to overfitting.  
+When fitting models, we perform variable transformation for **name** and **minimum_night**.   
+- **name**: we convert it from character to numeric (**unigram** and **bigram**). This process is explained in details in Model 4 of section 4.  
+- **minimum_night**: this feature is transformed from numeric to a factor with 2 levels (**short** and **long**). The motivation for this is explained in Model 2 of section 4.  
+
+```{r data cleaning}
+# Check duplicated rows
+data <- data %>% distinct()
+
+# Remove outliers: price < 500
+data <- filter(data,price <= 500)
+
+# Convert neighbourhood_group from character to factor
+data <- mutate(data, 
+               neighbourhood_group=factor(neighbourhood_group,
+                                          levels = unique(neighbourhood_group)),
+               room_type=factor(room_type,levels = unique(room_type)))
+
+# last_review: only keep the year and convert to numeric. 
+# keep only year
+data <- mutate(data,
+               last_review=substring(last_review,first=1,last=4))
+# convert to numeric
+data <- mutate(data,
+               last_review=as.numeric(last_review))
+
+# replace NA values of last_review and reviews_per_month with 0. 
+data[is.na(data)] <- 0 
+```
+
+```{r unigram}
+### Unigram transformation
+# Lower case, only keep alphabet characters, split the name, save all words into a vector
+listing <- data[,2]
+listing <- tolower(listing) # lowercase all words
+listing <- gsub("([^a-z ])+", "",listing) # only keep alphabet characters
+listing <- gsub("  ", " ",listing) 
+listing <- strsplit(listing, split = " ")
+listing <- unlist(listing)
+listing <- listing[listing != ""]
+# Load stopwords file and remove all stopwords in listing
+stopwords <- read.table(file="data/stopwords.txt")
+stopwords <- stopwords[1:nrow(stopwords),]
+'%notin%' <- Negate('%in%')
+listing <- listing[listing %notin% stopwords] # remove stopwords in app.word
+# Create a dictionary to store words and frequency
+library(hash)
+dict <- hash()
+for (word in listing){
+  if (has.key(word,dict)){
+    dict[[word]] <- dict[[word]] + 1
+  } else {
+    dict[[word]] <- 1
+  }
+}
+
+z <- order(values(dict),decreasing = TRUE)
+values <- values(dict)[z]
+keys <- keys(dict)[z]
+
+# name.col: the original names after splitting into every words & remove stop words
+name.col <- data[,2]
+name.col <- tolower(name.col)
+name.col <- gsub("([^a-z ])+", "",name.col)
+name.col <- gsub("  ", " ",name.col)
+name.col <- strsplit(name.col, split = " ")
+```
+
+```{r Bigram}
+### Bigram transformation
+ori.data <- read.csv("data/AB_NYC_2019.csv")
+ori.data <- filter(ori.data,price<=500)
+
+splitword <- function(x){
+  x <- tolower(x) # lowercase all words
+  x <- gsub("([^a-z ])+", "",x) # only keep alphabet characters
+  x <- gsub("  ", " ",x) 
+  x <- strsplit(x, split = " ")
+  x <- unlist(x)
+  x <- x[x != ""]
+  x <- x[x %notin% stopwords]
+  return(x)
+}
+
+split2words <- function(y){
+  len <- length(y)
+  result <- c()
+  for (p in 1:(len-1)){
+    result <- c(result,paste(y[p],y[p+1]))
+  }
+  return(result)
+}
+
+fulllist.2words <- c() # store all two adjacent words of the whole column
+ori.column <- ori.data$name # store original name without any preprocessing
+
+for (d in 1:length(ori.column)){
+  name.trans <- split2words(splitword(ori.column[d]))
+  fulllist.2words <- c(fulllist.2words,name.trans)
+}
+
+# map.2words: store top 100 two adjacent words that occur the most frequent
+map.2words <- sort(summary(as.factor(fulllist.2words)),decreasing = TRUE)
+map.2words <- map.2words[-1]
+map.2words <- names(map.2words)
+
+# name.trans2words <- name converted to numeric
+name.trans2words <- rep(0,length(ori.column))
+for (r in 1:length(name.trans2words)){
+  newname <- split2words(splitword(ori.column[r]))
+  for (w in 1:length(newname)){
+    if (newname[w] %in% map.2words){
+      name.trans2words[r] <- name.trans2words[r] + 1
+    }
+  }
+}
+```
+
+```{r training & test set}
+### Divide into a training set and a test set
+set.seed(10)
+train = sample(1:nrow(data),0.8*nrow(data))
+Train = data[train,]
+Test = data[-train,]
+write.csv(Train,"/Users/uyenhuynh/workspace/airbnb-predict/data/Train.csv")
+write.csv(Test,"/Users/uyenhuynh/workspace/airbnb-predict/data/Test.csv")
+```
+
+## 3. Data Visualization
+
+We perform exploratory data analysis using histograms, density plots, scatter plots,
+correlation matrix, and box plots to understand more about the data set. Our prediction target is
+price, so it is very important to see the distribution of this variable.
+
+```{r figure1, fig.cap="Figure 1: Distribution of Price", fig.topcaption=TRUE}
+fulldata <- read.csv("data/AB_NYC_2019.csv")
+ggplot(fulldata)+
+  geom_density(aes(x=price),alpha=0.5,fill="blue") + hw +
+  geom_vline(xintercept = mean(fulldata$price)) + 
+  labs(title="Price Distribution",
+       subtitle = "Mean of Price: $152")
+```
+
+We can see that the distribution of price is extremely skewed to the left with only 2.1% of listings having rental
+price per night over \$500. From our subjective understanding, Airbnb listings with over \$500 per
+night are very luxurious places or they could simply be data crawling errors, scams, or the results
+of someone wanting to test the limit of the Airbnb system (there are 6 listings with price as much
+as \$10000/night). If we are to fit a statistical learning model on this kind of data set with so many
+outliers, the result could become very catastrophic. **As a result, we decide to drop these outliers
+which consist of all listings with over $500 per night**. This also fits nicely with our project goal
+which is to focus on learning what factors contribute to the rental price of the majority (97.9% in
+the data set) of Airbnb listings, rather than trying to make a model fit well on the extremely pricey
+listings (the other 2.1%) which seems to be an extremely difficult task.
+
+```{r figure2, fig.cap="Figure 2: Distribution of Price (Price <= 500)", fig.topcaption=TRUE}
+ggplot(data)+
+  geom_density(aes(x=price),alpha=0.5,fill="blue") + hw +
+  geom_vline(xintercept = mean(data$price)) + 
+  labs(title="Price Distribution|Price <= 500",
+       subtitle = "Mean of Price: $132")
+```
+
+Next, we would like to visualize the relationship between target and predictor variables. As we know, one of the most important factors that contributes to the rental price of one listing is the current market price. This means that when a host puts their listing on Airbnb, they would have to make comparisons between the prices of all listings in the same neighbourhood or within a close proximity to determine the price for their own listing. Therefore, **neighbourhood_group** is a useful feature that will help us understand more about the distribution of the target variable. We visualize the **neighbourhood_group** vs **price** distribution in Figure 3. According to the figure, Manhattan and Brooklyn tend to have higher prices than the other boroughs. In addition, on Figure 4, the listings in Manhattan and Brooklyn are the most densely populated areas in New York.
+
+```{r figure3, echo=FALSE, fig.cap="Figure 3: Price and Neighbourhood_group", fig.topcaption=TRUE}
+ggplot(data,aes(x=neighbourhood_group,y=price,col=neighbourhood_group))+
+  geom_boxplot() + hw +
+  labs(title="Price and Neighbourhood_group",
+       subtitle = "New York City Airbnb")
+```
+
+```{r figure4, echo=FALSE, fig.cap="Figure 4: Number of listings in each neighbourhood_group", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+ggplot(data,aes(x=neighbourhood_group,fill=neighbourhood_group))+
+  geom_histogram(stat="count",col="black") + hw +
+  labs(title="Neighbourhood_group",
+       subtitle = "New York City Airbnb")
+```
+We continue to perform data visualization between **longitude/latitude** and **price**, which describes how listing price differs according to geographical location. Figure 5a shows all listings divided into each borough, while Figure 5b separates all observations according to 4 price groups. We would like to compare these two plots to discover patterns about the relationship between location and price. It can be observed that Manhattan (areas around longitude -70.4 and latitude 40.75) has more listings in the range \$200-\$300 and over \$300, while other boroughs have most listings less than \$200. This shows that there exists a relationship between geographical locations and price that we could exploit later when fitting statistical learning models.
+
+```{r figure5a, echo=FALSE, fig.cap="Figure 5a: Longtitude, Lattitude and Neighbourhood_group", fig.topcaption=TRUE}
+ggplot(data, aes(x=longitude,y=latitude,fill=neighbourhood_group))+
+  geom_point(shape = 21, size = 1.2, color= "black") + hw +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  labs(title="Longtitude, Lattitude and Neighbourhood_group",
+       subtitle = "New York City Airbnb")
+```
+
+```{r figure5b, echo=FALSE, fig.cap="Figure 5b: Longtitude, Lattitude and Price Groups", fig.topcaption=TRUE}
+price_group <- data
+price_group <- price_group %>%
+  mutate(group=cut(price,breaks=c(-1,101,201,301,10000)))
+price_group$group <- factor(price_group$group,
+                            labels = c("<$100","$100-$200","$200-$300",">$300"))
+ggplot(price_group, aes(x=longitude,y=latitude,fill=group))+
+  geom_point(shape = 21, size = 1.2,na.rm = TRUE) + hw +
+  theme(legend.position = "bottom") +
+  labs(title = "Longitude, Latitude and Price Groups",
+       subtitle = "New York City Airbnb")
+```
+
+Next, we would like to explore how price changes according to the types of room being offered at an Airbnb listing (variable **room_type**). From Figure 6, it can be seen that the cost for an entire home/apartment is the highest, while a shared room is the best solution for tenants who want to save money. It is very clear to conclude that the **room_type** feature definitely has a strong effect on rental price.
+
+```{r figure6, echo=FALSE, fig.cap="Figure 6: Price and Room_Type", fig.topcaption=TRUE}
+ggplot(data,aes(x=price,col=room_type,fill=room_type))+
+  geom_density(alpha=0.5) + hw + 
+  labs(title="Room_type and Price",
+       subtitle = "New York City Airbnb")
+```
+
+Apart from **room type**, when a tenant is looking for a listing, they also need to check the requirement about the minimum number of days they need to rent. In our data set, this requirement is represented as the "**minimum_night**" variable. According to Figure 7, it can be observed that listings with lower number of **minimum_nights** tend to charge customers with higher prices. In other words, the price for a short-term lease is mostly higher than that of a long-term lease requirement. This shows that **minimum_nights** definitely has a relationship with **price** that would allow for more accurate prediction when fitting models.
+
+```{r figure7, echo=FALSE, fig.cap="Figure 7: Price and Minimum_nights", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+ggplot(data,aes(x=minimum_nights,y=price,fill=room_type))+
+  geom_point(shape=21,size=1.2,color="black") + hw + xlim(c(0,400)) + 
+  labs(title="Minimum_nights and Price",
+       subtitle = "New York City Airbnb")
+```
+
+Next, we would like to explore the **number_of_reviews** and **reviews_per_month** variables because we think they are important factors that contribute to the price. Now, look at our data set, Figure 8 and 9 show that the number of reviews and monthly number of reviews tend to be higher for the listings in a low-price group. This makes sense because when a listing price is lower, it will attract more tenants and thus more reviews. 
+
+```{r figure8, echo=FALSE, fig.cap="Figure 8: Price and Number_of_reviews", fig.topcaption=TRUE}
+ggplot(data,aes(x=number_of_reviews,y=price,fill=neighbourhood_group))+
+  geom_point(shape=21,size=2,color="black") + hw +
+  labs(title="Price and Number_of_reviews",
+       subtitle = "New York City Airbnb")
+```
+
+```{r figure9, echo=FALSE, fig.cap="Figure 9: Price and Reviews_per_month", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+ggplot(price_group,aes(x=reviews_per_month,y=price,fill=group))+
+  geom_point(shape=21,size=2,color="black") + hw + xlim(c(0,20)) +
+  labs(title="Price and Reviews_per_month",
+       subtitle = "New York City Airbnb")
+```
+
+Another feature we want to explore is **availability_365**, which is the number of available days through the year 2019 that customers can book at a listing. It can be seen from Figure 10 that the higher the prices are, the more available days the listings have. This makes sense since more expensive listings tend to have fewer tenants throughout the year.
+
+```{r figure10, echo=FALSE, fig.cap="Figure 10: Price and Availability_365", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+ggplot(price_group,aes(x=group,y=availability_365,fill=group))+
+  geom_boxplot() + hw + 
+  labs(title="Price and Availability_365",
+       subtitle = "New York City Airbnb")
+```
+
+Finally, we would like to use the scatterplot matrix with hexagon binning and smooth lines, and correlation matrix to visualize the bivariate relationship between pairs of variables. According to Figure 11, there exists a highly correlated relationship between **number_of_reviews** and **reviews_per_month**. Also, the correlation matrix (Figure 12) shows that the correlation coefficient between these two variables is very high (0.59). This is an indicator for us to explore whether there is an interaction effect between number of reviews and monthly number of reviews.
+
+```{r figure11, echo=TRUE, fig.cap="Figure 11: Scatter plot matrix", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+onDiag <- function(x, ...){
+  yrng <- current.panel.limits()$ylim
+  d <- density(x, na.rm = TRUE)
+  d$y <- with(d, yrng[1] + 0.95 * diff(yrng) * y / max(y) )
+  panel.lines(d,col = rgb(.83,.66,1),lwd = 2)
+  diag.panel.splom(x, ...)
+}
+
+offDiag <- function(x,y,...){
+  panel.grid(h = -1,v = -1,...)
+  panel.hexbinplot(x,y,xbins = 15,...,border = gray(.7),
+                   trans = function(x)x^.5)
+  panel.loess(x , y, ..., lwd = 2,col = 'red')
+}
+
+scatter <- data[,c(10:12,14:16)]
+colnames(scatter) <- c("price","nights","total.reviews","reviews/mon","host.listings","availability")
+splom(scatter, as.matrix = TRUE,
+      xlab = '',main = "New York City Airbnb",
+      pscale = 0, varname.cex = 0.8,axis.text.cex = 0.6,
+      axis.text.col = "purple",axis.text.font = 2,
+      axis.line.tck = .5,
+      panel = offDiag,
+      diag.panel = onDiag)
+```
+
+```{r figure12, fig.cap="Figure 12: Correlation matrix", fig.topcaption=TRUE}
+cor.data <- data[,c(10:12,14:16)]
+corrplot(cor(cor.data), method="color", tl.col = "black", mar = c(0,0,0.8,0),
+         title = "New York City Airbnb")
+corrplot(cor(cor.data), add=TRUE, type = "lower", 
+         method = "number",number.font = 2,
+         number.cex = .75,col = "black",
+         diag = FALSE,tl.pos = "n", cl.pos = "n")
+```
+
+## 4. Proposed Model
+In this section, we investigate different statistical learning approaches, namely multiple linear regression and random forest, to predict the price of listings as well as to determine the main contributing factors to these listing expenses. We start with an elementary baseline linear regression model that uses most of the provided variables. Upon analysis of the baseline model, we further perform additional techniques such as incorporating interaction between different terms, transforming textual features into numeric values, and categorizing numeric features into factors so as to better assist these statistical learning methods in modeling the relationship between the provided features with the Airbnb listing price.
+
+#### Model 1 (baseline): Price ~ neighbourhood_group + latitude + longitude + room_type + minimum_nights + number_of_reviews + last_review + reviews_per_month + calculated_host_listings_count + availability_365
+This is a baseline model that simply uses most of the features provided in the dataset in their original format (excluding **listing id**, **name**, **host_id**, **host_name** and **neighbourhood**).
+
+```{r echo=TRUE}
+#exclude 4 columns: id, hostid, hostname,neighbourhood
+Train <- Train[,-c(1,3,4,6)] # base Train
+Test <- Test[,-c(1,3,4,6)] # base Test
+Train.y <- Train$price
+Test.y <- Test$price
+```
+
+```{r model1, echo=TRUE}
+## Cross Validation
+set.seed(10)
+Train1 = Train[,-1]
+Test1 = Test[,-1]
+cv.model1 = glm(price~., data = Train1)
+cv.err1 = cv.glm(data=Train1, cv.model1, K=10)$delta[1] # 4530.315
+cv.rerr1 <- (cv.err1)^0.5
+
+## Training & Test
+eval <- function(fit,Train,Test){
+  train.predict=predict(fit,data=Train)
+  train.err=mean((train.predict-Train.y)^2)
+  test.predict=predict(fit,newdata=Test)
+  test.err=mean((test.predict-Test.y)^2)
+  MSE <- c(train.err,test.err)
+  RMSE <- MSE^0.5
+  return(RMSE)
+}
+
+lm.fit1 = lm(price~.,data=Train1) 
+RMSE1 <- eval(lm.fit1,Train1,Test1)
+```
+```{r model1 output}
+# the 10-fold cross validation RMSE
+print(cv.rerr1) 
+# Training RMSE
+print(RMSE1[1])
+# Summary output of Model 1
+summary(lm.fit1)
+```
+  
+**The 10-fold cross validation RMSE is 67.3157**. Very fortunately, from the output, we can see that all of the variables appear to be significant for the linear regression model in making price prediction. This is parallel with our observations from Section 3 that these variables should have a major effect on the listing price. As we seek to reduce the RMSE even more, we employ additional techniques to dive deeper into some variables which we believe would help predicting price more accurately.
+
+There are four ideas to improve the baseline model accuracy:
+
+##### 1. minimum_nights:  
+According to Figure 13a & Figure 13b, the distribution of **minimum_nights** is highly skewed to the left and concentrating within the range from 1 to 10 (only 13.5% of the listings require customers over 10 minimum nights). If we directly use the original **minimum_nights** numbers, then rare observations (for example, there is only one listing requiring at least 1000 nights) will become an outlier which can have an influence on the model output and accuracy. Hence, it would be better to convert this feature from numeric data to a factor with 2 levels: the first level (“**short**”) indicates a short-term lease which applies for all listings with minimum nights less than or equal to 10; the second level (“**long**”) describes a long-time lease and applies to all listings where customers have to spend at least 11 nights.
+```{r figure13a, echo=FALSE, fig.cap="Figure 13a: Minimum_nights Distribution", fig.topcaption=TRUE}
+data.night.log <- mutate(data,minimum_nights = minimum_nights^0.2)
+ggplot(data,aes(x=minimum_nights,y=..density..)) +
+  geom_histogram(fill="blue",col="black",alpha=0.7,bins=80) + hw + 
+  labs(title="Minimum_nights Distribution")
+```
+```{r figure13b, echo=FALSE, fig.cap="Figure 13b: Minimum_nights Distribution (Minimum_nights <=10)", fig.topcaption=TRUE, message=FALSE, warning=FALSE}
+ggplot(data,aes(x=minimum_nights,y=..density..)) +
+  geom_histogram(fill="blue",alpha=0.8,bins=10,col="black") + hw + 
+  xlim(c(0,10)) + 
+  labs(title="Minimum_nights Distribution",
+       subtitle="Minimum_nights <= 10")
+```
+
+##### 2. reviews_per_month & num_of_reviews: 
+Both these features should have an impact on price prediction since they describe whether a listing is attractive or judged as bad by many people. This is clearly shown in the summary output above where we can see both these variables having very significant p-values. However, since we find from Figure 12 that these two variables are highly correlated, we suspect that by further exploring their relationship (such as taking a division between **num_of_reviews** by **reviews_per_month** to attain the number of months a listing has been put on), we could facilitate more improvement on our linear regression model.
+
+##### 3. name: 
+We make an assumption that listing name also helps in price prediction for listings on Airbnb. This stems from the observation that listing name possibly contains keywords that describe particular features about the listing that are not covered by the other variables (e.g., “spacious”, “sunny”, “times square”). Therefore, we propose to convert listing name from its textual form to numeric values so that we can fit the linear regression model and study its effect on price prediction. The idea is to extract the most frequent keywords and count the occurrence of them in the listing names.
+
+##### 4. Latitude and longitude: 
+We believe geographical features should have a major effect on prices. For example, listings at Manhattan are much more expensive than most of the other places. Geographical locations are made up of two variables - **latitude** and **longitude**. This means that using any of the 2 features alone is not sufficient to model geographical locations. Therefore, we propose to add an interaction term for latitude and longitude so that the model can better capture these geographical patterns.
+
+We will employ these 4 ideas in the following models below.
+
+#### Model 2: Baseline + Convert minimum_nights (variable transformation)
+Here, we will implement the first idea for model 2, where we combine the baseline model and the transformation of **minimum_nights** feature. Now **minimum_nights** is converted from its numeric format to a factor with 2 levels (“**short**” and “**long**”) denoting whether a listing booking requirement is short-term or long-term.
+
+```{r model2, include=FALSE}
+Train2 <- mutate(Train1, 
+                 minimum_nights=factor(ifelse(minimum_nights<=10,"short","long")))
+Test2 <- mutate(Test1, 
+                minimum_nights=factor(ifelse(minimum_nights<=10,"short","long")))
+
+# Cross Validation
+set.seed(10)
+cv.model2 = glm(price~., data = Train2)
+cv.err2 = cv.glm(data=Train2, cv.model2, K=10)$delta[1]
+cv.rerr2 <- cv.err2^0.5
+
+# Training and Test
+lm.fit2 = lm(price~.,data=Train2)
+RMSE2 <- eval(lm.fit2,Train2,Test2) 
+```
+```{r model2 output}
+# the 10-fold cross validation RMSE
+print(cv.rerr2) 
+# Training RMSE
+print(RMSE2[1])
+# Summary output of model 2
+summary(lm.fit2)
+```
+
+**The 10-fold cross validation RMSE is 66.6676**, which is lower than the baseline model. This shows that by denoting **minimum_nights** as short-term or long-term, we are able to effectively reduce the RMSE and produce a more accurate price prediction model. This can be intuitively explained as following: when a host puts their listing booking requirement as short-term on the lease market, it means they offer greater flexibility for tenants but at the cost of a higher renting expense. Therefore, it makes sense for the short/long-term requirement to have an impact on rental price.
+
+#### Model 3: Baseline + Convert minimum_night + reviews_per_month/number_of_reviews (interaction effect)
+We would like to investigate the interaction effect between **reviews_per_month** and **number_of_reviews** in model 3 because these two variables have a strong correlation as demonstrated in Figure 12. Instead of using a multiplication term for these 2 variables, we **divide the number_of_reviews by the reviews_per_month variable** to get the number of months a listing has been publicly put on the Airbnb platform. Our assumption is that the longer a listing has been available for renting on Airbnb, the more reliable and well-received it is for many customers (since otherwise, the host would no longer be able to rent it out to tenants).
+
+```{r model3, include=FALSE}
+Train3 <- mutate(Train2,reviews_per_month=reviews_per_month+0.001)
+Test3 <- mutate(Test2,reviews_per_month=reviews_per_month+0.001)
+Train3<- mutate(Train3,month=number_of_reviews/reviews_per_month)
+Test3<- mutate(Test3,month=number_of_reviews/reviews_per_month)
+
+# Cross Validation
+set.seed(10)
+cv.model3 = glm(price~., data = Train3)
+cv.err3 = cv.glm(data=Train3, cv.model3, K=10)$delta[1] 
+cv.rerr3 <- cv.err3^0.5
+
+# Training & Test set
+lm.fit3 = lm(price~.,data=Train3)
+RMSE3 <- eval(lm.fit3,Train3,Test3)
+```
+```{r model3 output}
+# the 10-fold cross validation RMSE
+print(cv.rerr3) 
+# Training RMSE
+print(RMSE3[1]) 
+# Summary output of model 3
+summary(lm.fit3)
+```
+
+**The 10-fold cross validation RMSE is 66.66339**, which is only slightly lower than the previous model. Nonetheless, the p-value of month is significant, which shows that our assumption about its relationship with listing price is correct. However, **reviews_per_month** variable is now no longer significant as its p-value has become higher. This is not a problem as explained in the ISLR book, page 89 (*An Introduction to Statistical Learning with Application in R, 2015*) where it says that as long as we have an interaction variable with a high significance level, it is not that necessary for the constituent term to be significant as well. Since the cross-validation RMSE of this model is still slightly better than that of the previous model, we decide to keep this interaction term.
+
+#### Model 4: Model 3 + Convert name (variable transformation)
+In the next model, we would like to investigate the effect of the name of listings on price. As explained above, the motivation for using listing name is that a host usually shows the main characteristics and distinctive features of a house in its name to attract customers. For example, when a host mentions “Times Square” in the name, they want to emphasize that their house has a good location which is in close proximity to one of the most famous places in New York. Other examples are “sunny”, “spacious”, and “renovated” which are attractive features that customers might be looking for. As we can see, all of the mentioned examples are important factors to determine the rental pricing. Therefore, it is necessary for us to analyze this feature to extract meaningful insights from it. However, it is not easy to perform this investigation if the name is displayed as textual data, so we need to convert it into numeric format.  
+The idea to perform this conversion is to create a set of the most frequent keywords, represented as 1-word keyword (unigram) or 2-word keyword (bigram), then record the number of occurrences of these keywords in a listing name. We will examine 3 approaches:   
+- (a) using unigram keywords.  
+- (b) using bigram keywords.  
+- (c) using both unigram and bigram keywords.
+
+##### a. Unigram keywords
+From the listing names in the training set, we create a set S consisting of the top 500 most frequent unigram keywords (the threshold 'top 500' is chosen by evaluating CV RMSE values with the threshold from 100 to 500). We then iterate over each listing name in the whole dataset, count the number of unigram keywords it has in its name and use that number as its feature rather than using its textual name. We show in Figure 14 the word cloud of this set S. 
+```{r unigram plot, echo=FALSE, fig.cap=" Figure 14: Unigram Wordcloud", fig.topcaption=TRUE}
+wordcloud(words = keys, freq = values, min.freq = 0,
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
+```{r model4a, echo=TRUE}
+## Cross Validation
+# Unigram: function to calculate CV errors with respect to the threshold. 
+CV.name1word <- function(newname){
+  set.seed(10)
+  newTrain <- mutate(Train3,name=newname[train])
+  cv.model=glm(price~.,data=newTrain)
+  cv.err <- cv.glm(data=newTrain, cv.model, K=10)$delta[1]
+}
+
+# name.transfer(threshold) is a function to convert an original name to numeric (one word)
+name.transfer <- function(threshold){
+  topkey <- keys[1:threshold]
+  result <- rep(0,length(name.col))
+  for (row in seq_along(name.col)){
+    for (word in unlist(name.col[row])){
+      if (word %in% topkey){
+        result[row] <- result[row] + 1
+      }
+    } 
+  }
+  return(result)
+}
+
+oneword <- c("threshold","err")
+for (thres in seq(100,500,by=100)){
+  new.name = name.transfer(thres)
+  err = CV.name1word(new.name)
+  oneword <- rbind(oneword,c(thres,err))
+}
+# show the CV errors for each threshold from 100 to 500
+print(oneword)
+
+# The best threshold is 500, so we will run the model with this threshold. 
+Train4 <- mutate(Train3,unigram=name.transfer(500)[train])
+Test4 <- mutate(Test3,unigram=name.transfer(500)[-train])
+cv.err4 <- CV.name1word(name.transfer(500))
+cv.rerr4 <- cv.err4^0.5
+
+## Training & Test set
+lm.fit4 = lm(price~.,data=Train4)
+RMSE4 <- eval(lm.fit4,Train4,Test4)
+```
+```{r model4a output}
+# the 10-fold cross validation RMSE
+print(cv.rerr4) 
+# Training RMSE
+print(RMSE4[1])
+# Summary output of model 4a
+summary(lm.fit4)
+```
+
+
+**The 10-fold cross validation RMSE of this model is 66.64549**, which is a bit smaller than the previous model. This shows that utilizing unigrams of listing names could be a good direction to tackle but there is still more work to be done in order to make it really effective in predicting price. We also see that its p-value (the one corresponding to variable unigram) is significant (0.03). We continue to use bigram instead of unigram in the next model.
+
+##### b. Bigram keywords
+Similarly to the above approach but this time, we use the top 100 bigram keywords (consisting of every two adjacent words) in the listing names. We show the top 100 most frequent bigram keywords in the following figure. 
+```{r bigram plot, echo=FALSE, message=FALSE, warning=FALSE}
+wordcloud(words = map.2words, freq = values, 
+          random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"))
+```
+
+```{r model4b, include=FALSE}
+## Cross Validation
+Train5 <- mutate(Train3,
+                 bigram=name.trans2words[train]) # add name.trans2word column
+Test5 <- mutate(Test3,
+                bigram=name.trans2words[-train])
+set.seed(10)
+cv.model5 = glm(price~., data = Train5)
+cv.err5 = cv.glm(data=Train5, cv.model5, K=10)$delta[1]
+cv.rerr5 <- cv.err5^0.5
+
+## Training & Test set
+lm.fit5 = lm(price~.,data=Train5)
+RMSE5 <- eval(lm.fit5,Train5,Test5)
+```
+```{r model4b output}
+# the 10-fold cross validation RMSE
+print(cv.rerr5) 
+# Training RMSE
+print(RMSE5[1])
+# Summary output of model 4b
+summary(lm.fit5)
+```
+
+
+**The 10-fold cross validation RMSE is 66.55733**, which is better than the unigram approach. Its p-value, the one corresponding to the bigram variable, is also significant (<2e-16). This potentially shows that bigram is more effective than unigram in describing particular features of the listings. Most examples we can see from the word cloud belong to locational features (e.g., “central park”, “east village”, “midtown east”, “time square”), room features (e.g., “spacious br”, “large private”, “brand new”) that are not described using any of the other variables in the data set. Therefore, explicitly using these bigrams helps our linear regression model to better predict model listing price.
+
+
+##### c. Using both unigram and bigram
+We now try using both unigram and bigram keywords. **The 10-fold cross validation RMSE is 66.46523**, which is smaller than that when using unigram or bigram alone. Both p-values of the unigram and bigram variables are also significant. Therefore, we decide to employ both unigram and bigram for our final model.
+```{r model4c, include=FALSE}
+Train6 <- mutate(Train3,
+                 bigram=name.trans2words[train], # add name.trans2word column
+                 unigram=name.transfer(500)[train]) # add name1word with threshold = 100
+Test6 <- mutate(Test3,
+                bigram=name.trans2words[-train], 
+                unigram=name.transfer(500)[-train])
+
+## Cross Validation
+set.seed(10)
+cv.model6 = glm(price~., data = Train6)
+cv.err6 = cv.glm(data=Train6, cv.model6, K=10)$delta[1]
+cv.rerr6 = cv.err6^0.5
+  
+## Training & Test
+lm.fit6 = lm(price~.,data=Train6)
+RMSE6 <- eval(lm.fit6,Train6,Test6)
+```
+```{r model4c output}
+# the 10-fold cross validation RMSE
+print(cv.rerr6) 
+# Training RMSE
+print(RMSE6[1])
+# Summary output of model 4c
+summary(lm.fit6)
+```
+
+Here is the summary of results of all of our models above. Model 4c is the one having the smallest error. 
+
+| Model | Residual standard error | Multiple R-squared | Training RMSE | Cross- validation RMSE |
+|---------|---------|---------|---------|---------|
+| Model 1 (Baseline) | 67.28 | 0.4169 | 67.26961 | 67.3157 |
+| Model 2 = Baseline + Transform minimum_night | 66.66 | 0.4276 | 66.64892 | 66.6676 |
+| Model 3 = Model 2 + number_of_reviews/reviews_per_mont | 66.66 | 0.4277 | 66.6434 | 66.66339 |
+| Model 4a = Model 3 + unigram | 66.63 | 0.4281 | 66.62011 | 66.64549 |
+| Model 4b = Model 3 + bigram | 66.55 | 0.4295 | 66.53595 | 66.55733 |
+| Model 4c = Model 3 + unigram + bigram | 66.45 | 0.4312 | 66.43863 | 66.46523 |
+
+## 5. Conclusion
+We would like conclude that the important factors which can determine the rental price in Airbnb New York market are:  
+- **neighbourhood_group**, **longitude**, **latitude**: these features represent the location of a listing. For a place having top-rated tourist attractions like New York, visitors tend to book a place near landmarks or famous sites. Therefore, it’s reasonable to confirm that location is one of the most influential components to determine prices.  
+- **room_type**, **minimum_nights**: this is true because the more flexibility the listing offers, the higher payment tenants have to pay.  
+- **number_of_reviews**: this is important because it reflects not only how well-received the listing is but also the reliability.  
+
+## References  
+(2015). In G. James, D. Wittern, T. Hastie, & R. Tibshirani, *An Introduction to Statistical Learning with Application in R* (p. 89). Springer Texts in Statistics.  
+(2019). Retrieved from Kaggle: https://www.kaggle.com/dgomonov/new-york-city-airbnb-open-data
